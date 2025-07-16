@@ -1,0 +1,13 @@
+input:
+  aws_s3:
+    bucket: <S3_BUCKET_NAME>
+    region: <S#_REGION_NAME>
+    credentials:
+      id: <AWS_ID>
+      secret: <AWS_KEY>
+    bookmarks_file:
+      path: ./bookmarks.json
+    watcher:
+      poll_interval: 5s
+output:
+  stdout: {}
