@@ -1,0 +1,34 @@
+input:
+  aws_s3:
+    bucket: "<S3_BUCKET_NAME>"
+    prefix: ""  # Optional: specify a prefix to filter files
+    region: "<AWS_REGION_NAME>"  # Change to your AWS region
+    sequential_batching: true
+    credentials:
+      id: <AWS_ID>
+      secret: <AWS_KEY>
+    bookmarks_file:
+      path: ./bookmarks.json
+    watcher:
+      poll_interval: 5s
+    scanner:
+      chunker:
+        size: 8
+
+pipeline:
+  threads: 1
+  processors:
+    - label: log
+      log:
+        level: INFO
+        message: "key: ${! meta(\"s3_key\")} content type: ${! meta(\"s3_content_type\")}"
+    - label: skip_folders
+      mapping: |
+        if (meta("s3_content_type") == "application/x-directory") {
+          root = deleted()
+        }
+        meta file_name =  meta("s3_key").filepath_split().index(-1)
+output:
+  file:
+    path: "./${! meta(\"file_name\")}"
+    codec: append

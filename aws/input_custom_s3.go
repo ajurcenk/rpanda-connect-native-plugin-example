@@ -52,15 +52,16 @@ const (
 	s3iSQSFieldWaitTimeSeconds = "wait_time_seconds"
 
 	// S3 Input Fields
-	s3iFieldBucket             = "bucket"
-	s3iFieldPrefix             = "prefix"
-	s3iFieldForcePathStyleURLs = "force_path_style_urls"
-	s3iFieldDeleteObjects      = "delete_objects"
-	s3iFieldSQS                = "sqs"
-	s3iBookmarksSection        = "bookmarks_file"
-	s3iBookmarksFilePath       = "path"
-	siFieldWatcher             = "watcher"
-	siFieldWatcherPollInterval = "poll_interval"
+	s3iFieldBucket                   = "bucket"
+	s3iFieldPrefix                   = "prefix"
+	s3iFieldForcePathStyleURLs       = "force_path_style_urls"
+	s3iFieldDeleteObjects            = "delete_objects"
+	s3iFieldSQS                      = "sqs"
+	s3iBookmarksSection              = "bookmarks_file"
+	s3iBookmarksFilePath             = "path"
+	siFieldWatcher                   = "watcher"
+	siFieldWatcherPollInterval       = "poll_interval"
+	siFieldSequentialBatchingSupport = "sequential_batching"
 )
 
 type s3iSQSConfig struct {
@@ -103,14 +104,15 @@ func s3iSQSConfigFromParsed(pConf *service.ParsedConfig) (conf s3iSQSConfig, err
 }
 
 type s3iConfig struct {
-	Bucket              string
-	Prefix              string
-	ForcePathStyleURLs  bool
-	DeleteObjects       bool
-	SQS                 s3iSQSConfig
-	CodecCtor           codec.DeprecatedFallbackCodec
-	BookmarkFilePath    string
-	WatcherPollInterval time.Duration
+	Bucket                           string
+	Prefix                           string
+	ForcePathStyleURLs               bool
+	DeleteObjects                    bool
+	SQS                              s3iSQSConfig
+	CodecCtor                        codec.DeprecatedFallbackCodec
+	BookmarkFilePath                 string
+	WatcherPollInterval              time.Duration
+	SequentialBatchingProcessingFlag bool
 }
 
 func s3iConfigFromParsed(pConf *service.ParsedConfig) (conf s3iConfig, err error) {
@@ -146,6 +148,9 @@ func s3iConfigFromParsed(pConf *service.ParsedConfig) (conf s3iConfig, err error
 		return
 	}
 
+	if conf.SequentialBatchingProcessingFlag, err = pConf.FieldBool(siFieldSequentialBatchingSupport); err != nil {
+		return
+	}
 	return
 }
 
@@ -194,6 +199,10 @@ You can access these metadata fields using xref:configuration:interpolation.adoc
 			service.NewStringField(s3iFieldPrefix).
 				Description("An optional path prefix, if set only objects with the prefix are consumed when walking a bucket.").
 				Default(""),
+			service.NewBoolField(siFieldSequentialBatchingSupport).
+				Description("Sequential batching support flag. The sequential batching is a method where batches processed one after another.").
+				Default(false).
+				Advanced(),
 		).
 		// Bookmarks manager configuration
 		Fields(bookmark.BookmarkFileManagerConfigFields()...).
@@ -771,6 +780,13 @@ func (s *sqsTargetReader) ackSQSMessage(ctx context.Context, msg sqstypes.Messag
 
 //------------------------------------------------------------------------------
 
+// pendingBatchInfo tracks the state of a batch that's been read but not yet acknowledged
+type pendingBatchInfo struct {
+	batch         service.MessageBatch
+	acknowledged  bool
+	originalAckFn service.AckFunc
+}
+
 // AmazonS3 is a benthos reader.Type implementation that reads messages from an
 // Amazon S3 bucket.
 type awsS3Reader struct {
@@ -791,6 +807,9 @@ type awsS3Reader struct {
 	log *service.Logger
 
 	bm *bookmark.BookmarkManager
+
+	pendingCond  *sync.Cond        // Condition variable for waiting on batch completion
+	pendingBatch *pendingBatchInfo // pending batch information
 }
 
 type s3PendingObject struct {
@@ -824,6 +843,9 @@ func newAmazonS3Reader(conf s3iConfig, awsConf aws.Config, nm *service.Resources
 		objectScannerCtor: conf.CodecCtor,
 		bm:                bm,
 	}
+
+	s.pendingCond = sync.NewCond(&s.objectMut)
+
 	if conf.SQS.DelayPeriod != "" {
 		var err error
 		if s.gracePeriod, err = time.ParseDuration(conf.SQS.DelayPeriod); err != nil {
@@ -959,6 +981,14 @@ func (a *awsS3Reader) ReadBatch(ctx context.Context) (msg service.MessageBatch, 
 		}
 	}()
 
+	// The sequential batching processing is enabled
+	if a.conf.SequentialBatchingProcessingFlag {
+		// Wait until the previous batch is acknowledged before proceeding
+		for a.pendingBatch != nil && !a.pendingBatch.acknowledged {
+			a.pendingCond.Wait() // Block until the previous batch is acknowledged
+		}
+	}
+
 	var object *s3PendingObject
 
 	// getObjectTarget might return nil objects for empty files, so we can just skip and get the nex file in this case.
@@ -996,10 +1026,48 @@ func (a *awsS3Reader) ReadBatch(ctx context.Context) (msg service.MessageBatch, 
 
 	s3MetaToBatch(object, resBatch)
 
+	var customAckFn func(rctx context.Context, res error) error
+
+	// The sequential batching processing is enabled
+	if a.conf.SequentialBatchingProcessingFlag {
+		pendingBatch := &pendingBatchInfo{
+			batch:         resBatch,
+			acknowledged:  false,
+			originalAckFn: scnAckFn,
+		}
+		a.pendingBatch = pendingBatch
+
+		customAckFn = func(rctx context.Context, res error) error {
+			// Call the original acknowledgment function first
+			ackErr := pendingBatch.originalAckFn(rctx, res)
+
+			// Now update state and signal waiting goroutines
+			func() {
+				a.objectMut.Lock()
+				defer a.objectMut.Unlock()
+
+				// Mark this batch as acknowledged
+				pendingBatch.acknowledged = true
+
+				// Clear the pending batch since it's now acknowledged
+				a.pendingBatch = nil
+
+				// Signal any waiting ReadBatch calls that they can proceed
+				a.pendingCond.Signal()
+			}()
+
+			return ackErr
+		}
+	} else {
+		// Old logic (no sequential batching processing )
+		customAckFn = func(rctx context.Context, res error) error {
+			return scnAckFn(rctx, res)
+		}
+	}
+
 	a.log.Infof("Exiting from ReadBatch()")
-	return resBatch, func(rctx context.Context, res error) error {
-		return scnAckFn(rctx, res)
-	}, nil
+
+	return resBatch, customAckFn, nil
 }
 
 // CloseAsync begins cleaning up resources used by this reader asynchronously.
